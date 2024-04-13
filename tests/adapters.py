@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import os
 from typing import IO, BinaryIO, Iterable, Optional, Type
-
+import regex as re
 import numpy.typing as npt
 import torch
 
@@ -569,4 +569,67 @@ def run_train_bpe(
                 representing that <token1> was merged with <token2>.
                 Merges are ordered by order of creation.
     """
-    raise NotImplementedError
+    PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
+    with open(input_path, "r") as f:
+        texts = f.read()
+    texts = re.findall(PAT, texts)
+    word_freq_dict = {}
+    for text in texts:
+        if text in word_freq_dict:
+            word_freq_dict[text] += 1
+        else:
+            word_freq_dict[text] = 1
+    word_freq_dict = dict(sorted(word_freq_dict.items(), key=lambda x: x[1], reverse=True))
+    word_split_dict = {word: word.split() for word in word_freq_dict}
+    vocab = {}
+    # add 0 to 255 decodes to vocab
+    for i in range(256):
+        vocab[i] = bytes([i])
+    # add special tokens to vocab
+    for i, token in enumerate(special_tokens):
+        vocab[i + 256] = token.encode()
+    merges = []
+    bytes_dict = {}
+    for word in word_freq_dict:
+        if len(word) == 1:
+            continue
+        for i in range(len(word) - 1):
+            if (word[i], word[i + 1]) in bytes_dict:
+                bytes_dict[(word[i], word[i + 1])] += word_freq_dict[word]
+            else:
+                bytes_dict[(word[i], word[i + 1])] = word_freq_dict[word]
+    bytes_dict = dict(sorted(bytes_dict.items(), key=lambda x: (-x[1], -x[0])))
+    while len(vocab) < vocab_size:
+        popped_bytes = bytes_dict.popitem([0])
+        merges.append((bytes(popped_bytes[0][0]), bytes(popped_bytes[0][1])))
+        vocab[len(vocab)] = bytes(popped_bytes[0][0]) + bytes(popped_bytes[0][1])
+        merge_bytes(word_split_dict, popped_bytes[0][0], popped_bytes[0][1])
+        for i in word_split_dict:
+            if (popped_bytes[0][0] + popped_bytes[0][1] not in i) or len(word_split_dict[i]) == 1:
+                continue
+            for j in range(1, len(word_split_dict[i]) - 1):
+                if word_split_dict[i][j] == popped_bytes[0][0] + popped_bytes[0][1]:
+                    if (word_split_dict[i][j - 1], word_split_dict[i][j]) in bytes_dict:
+                        bytes_dict[(word_split_dict[i][j - 1], word_split_dict[i][j])] += word_freq_dict[i]
+                    else:
+                        bytes_dict[(word_split_dict[i][j - 1], word_split_dict[i][j + 1])] = word_freq_dict[i]
+                    if (word_split_dict[i][j], word_split_dict[i][j + 1]) in bytes_dict:
+                        bytes_dict[(word_split_dict[i][j], word_split_dict[i][j + 1])] += word_freq_dict[i]
+                    else:
+                        bytes_dict[(word_split_dict[i][j], word_split_dict[i][j + 1])] = word_freq_dict[i]
+                bytes_dict[(word_split_dict[i][j - 1], popped_bytes[0][0])] -= word_freq_dict[i]
+                bytes_dict[(popped_bytes[0][1], word_split_dict[i][j + 1])] -= word_freq_dict[i]
+        bytes_dict = dict(sorted(bytes_dict.items(), key=lambda x: (-x[1], -x[0])))
+    
+    return vocab, merges
+                
+                    
+
+def merge_bytes(*input_dict, char1, char2):
+    for key in input_dict:
+        if char1 not in key or char2 not in key:
+            continue
+        for i in range(len(input_dict[key]) - 1):
+            if input_dict[key][i] == char1 and input_dict[key][i + 1] == char2:
+                input_dict[key][i] = input_dict[key][i][0:i] + [char1 + char2] + input_dict[key][i+2:]
+    return input_dict
